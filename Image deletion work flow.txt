@@ -1,0 +1,181 @@
+# Image Deletion and Recovery Process
+
+## Overview
+
+This document outlines the image deletion and recovery process for the Matsight application. The system implements a "soft delete" approach that allows for potential recovery of deleted images within a defined time period.
+
+## Deletion Process
+
+When a user initiates an image deletion from the frontend, the following process occurs:
+
+1. **Frontend Request**
+   - User selects an image and clicks the delete button
+   - Frontend sends a DELETE request to the DeleteImage API with the `image_key`
+   - The request format: `{ "image_key": "user_id/path/to/image.jpg" }`
+
+2. **Backend Processing - Database Soft Delete**
+   - The DeleteImage Lambda function receives the request
+   - Before deleting from S3, it calls the data storage service with:
+     ```json
+     {
+       "method": "UPDATE",
+       "model": "images",
+       "filter": {
+         "s3_key": "user_id/path/to/image.jpg",
+         "is_deleted": false
+       },
+       "data": {
+         "is_deleted": true,
+         "deleted_at": "CURRENT_TIMESTAMP"
+       }
+     }
+     ```
+   - This marks the image as deleted in the database but retains all metadata
+   - The system verifies the database update was successful
+
+3. **S3 Delete Marker Creation**
+   - After successful database update, the Lambda function adds a delete marker to the S3 object:
+     ```python
+     s3_client.delete_object(
+         Bucket=bucket_name,
+         Key=image_key,
+         # This creates a delete marker rather than permanently deleting
+         VersionId=None  # When versioning is enabled, this creates a delete marker
+     )
+     ```
+   - The image appears deleted to users but is actually preserved in S3 with a delete marker
+   - The S3 bucket must have versioning enabled for this to work
+
+4. **Response to Frontend**
+   - The Lambda function returns a success response with details about the deletion
+   - Frontend updates the UI to reflect the deleted state of the image
+
+## Recovery Process
+
+When a user or administrator wants to recover a deleted image:
+
+1. **Frontend Recovery Request**
+   - User selects a deleted image from the "Deleted Images" section
+   - Frontend sends a POST request to the RecoverImage API with the `image_key`
+   - Request format: `{ "image_key": "user_id/path/to/image.jpg" }`
+
+2. **Backend Processing - Database Record Update**
+   - The RecoverImage Lambda function receives the request
+   - It calls the data storage service to update the image record:
+     ```json
+     {
+       "method": "UPDATE",
+       "model": "images",
+       "filter": {
+         "s3_key": "user_id/path/to/image.jpg",
+         "is_deleted": true
+       },
+       "data": {
+         "is_deleted": false,
+         "deleted_at": null
+       }
+     }
+     ```
+   - This unmarks the image as deleted in the database
+   - The system verifies the database update was successful
+
+3. **S3 Delete Marker Removal**
+   - After successful database update, the Lambda function removes the delete marker:
+     ```python
+     # First, list object versions to find the delete marker
+     versions = s3_client.list_object_versions(
+         Bucket=bucket_name,
+         Prefix=image_key
+     )
+     
+     # Find the delete marker
+     delete_marker = next((v for v in versions.get('DeleteMarkers', []) 
+                         if v['Key'] == image_key and v['IsLatest']), None)
+     
+     if delete_marker:
+         # Remove the delete marker
+         s3_client.delete_object(
+             Bucket=bucket_name,
+             Key=image_key,
+             VersionId=delete_marker['VersionId']
+         )
+     ```
+   - This makes the image accessible again in S3
+
+4. **Response to Frontend**
+   - The Lambda function returns a success response
+   - Frontend updates the UI to show the recovered image
+
+## Configuration Requirements
+
+To implement this process, the following configurations are required:
+
+1. **S3 Bucket Configuration**
+   - Enable versioning on the S3 bucket:
+     ```
+     aws s3api put-bucket-versioning --bucket your-bucket-name --versioning-configuration Status=Enabled
+     ```
+   - Set up lifecycle rules to permanently delete markers after a certain period (e.g., 30 days):
+     ```
+     aws s3api put-bucket-lifecycle-configuration --bucket your-bucket-name --lifecycle-configuration file://lifecycle-config.json
+     ```
+
+2. **Database Schema**
+   - The images table includes these fields for soft delete:
+     - `is_deleted` (BOOLEAN) - flag indicating if the image is deleted
+     - `deleted_at` (TIMESTAMP) - when the image was deleted
+
+3. **API Configuration**
+   - Create a new `RecoverImage` Lambda function and API endpoint
+   - Update the `DeleteImage` function to implement soft delete
+
+## Automatic Cleanup Process
+
+To manage storage costs, the system automatically handles permanent deletion:
+
+1. **S3 Lifecycle Policy**
+   - Delete markers and old versions are permanently removed after 30 days
+   - This is configured via S3 lifecycle policies
+
+2. **Database Cleanup Job**
+   - A scheduled Lambda function permanently deletes records where:
+     - `is_deleted = true`
+     - `deleted_at < (CURRENT_DATE - 30 days)`
+   - This job runs weekly to maintain database performance
+
+## Viewing Deleted Images
+
+1. **User Interface**
+   - A "Trash" or "Recently Deleted" section in the UI
+   - Shows images with `is_deleted = true` and `deleted_at` within the last 30 days
+   - Options to "Restore" or "Delete Permanently"
+
+2. **API Endpoint**
+   - List deleted images endpoint:
+     ```json
+     {
+       "method": "GET",
+       "model": "images",
+       "filter": {
+         "user_id": 123,
+         "is_deleted": true
+       }
+     }
+     ```
+
+## Security Considerations
+
+1. **Access Control**
+   - Users can only recover their own images
+   - Admin users can recover any image
+
+2. **Audit Trail**
+   - All delete and recover operations are logged
+   - Logs include user ID, timestamp, and action details
+
+## Implementation Timeline
+
+1. Phase 1: Database soft delete implementation
+2. Phase 2: S3 versioning and delete marker implementation
+3. Phase 3: Recovery UI and API development
+4. Phase 4: Cleanup job implementation
